@@ -1,4 +1,5 @@
 import pandas as pd
+import polars as pl
 import numpy as np
 from collections import defaultdict, Counter
 import json
@@ -25,7 +26,11 @@ class AggregateAllEpitopes:
         raise Exception("Must implement method in child class")
 
     @abstractmethod
-    def read_input_file(self, key, used_columns, dtypes):
+    def read_input_file(self, used_columns, dtypes):
+        raise Exception("Must implement method in child class")
+    
+    @abstractmethod
+    def get_sub_df(self, df, key):
         raise Exception("Must implement method in child class")
 
     @abstractmethod
@@ -143,21 +148,25 @@ class AggregateAllEpitopes:
     def set_column_types(self, prediction_algorithms):
         dtypes = {
             'Chromosome': str,
-            "Start": "int32",
-            "Stop": "int32",
+            "Start": pl.Int32,
+            "Stop": pl.Int32,
             'Reference': str,
             'Variant': str,
-            "Variant Type": "category",
-            "Mutation Position": "category",
-            "Median MT Score": "float32",
-            "Median MT Percentile": "float16",
-            "Protein Position": "str",
+            "Variant Type" : pl.Categorical,
+            "Mutation Position": pl.Categorical,
+            "Median MT Score": pl.Float32,
+            "Median MT Percentile": pl.Float32,
+            "Protein Position": str,
+            "Tumor RNA Depth": pl.Float32,
+            "Tumor RNA VAF": pl.Float32,
+            "Tumor DNA VAF": pl.Float32,
+            "Gene Expression": pl.Float32
         }
         for algorithm in prediction_algorithms:
             if algorithm == 'SMM' or algorithm == 'SMMPMBEC':
                 continue
-            dtypes["{} MT Score".format(algorithm)] = "float32"
-            dtypes["{} MT Percentile".format(algorithm)] = "float16"
+            dtypes["{} MT Score".format(algorithm)] =  pl.Float32
+            dtypes["{} MT Percentile".format(algorithm)] =  pl.Float32
         return dtypes
 
     def execute(self):
@@ -184,13 +193,22 @@ class AggregateAllEpitopes:
             metrics = {}
 
         data = []
+        all_epitopes_df = self.read_input_file(used_columns, dtypes)
         for key in keys:
-            (df, key_str) = self.read_input_file(key, used_columns, dtypes)
+            (df, key_str) = self.get_sub_df(all_epitopes_df, key)
             (best_mut_line, metrics_for_key) = self.get_best_mut_line(df, key_str, hla_types, prediction_algorithms, vaf_clonal, 1000)
             data.append(best_mut_line)
             metrics[key_str] = metrics_for_key
-        peptide_table = pd.DataFrame(data=data)
+        peptide_table = pl.DataFrame(data=data)
         peptide_table = self.sort_table(peptide_table)
+
+        peptide_table = peptide_table.to_pandas() # Because polars write_csv encloses spaces with doble quotes, back to pandas
+        peptide_table.replace(to_replace=[None], value=np.nan, inplace=True)
+        peptide_table.fillna(value="NA", inplace=True)
+        if "IC50 WT" in peptide_table.columns:
+            peptide_table["IC50 WT"] = peptide_table["IC50 WT"].astype(str)
+        if "%ile WT" in peptide_table.columns:
+            peptide_table["%ile WT"] = peptide_table["%ile WT"].astype(str)
 
         peptide_table.to_csv(self.output_file, sep='\t', na_rep='NA', index=False, float_format='%.3f')
 
@@ -235,30 +253,60 @@ class PvacseqAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCMeta):
             print("Tumor clonal VAF estimated as {} (estimated from Tumor DNA VAF data). Assuming variants with VAF < {} are subclonal".format(round(vaf_clonal, 3), round(vaf_clonal/2, 3)))
             return vaf_clonal
 
-    def read_input_file(self, key, used_columns, dtypes):
+    def read_input_file(self, used_columns, dtypes):
+        # return pd.read_csv(self.input_file, delimiter='\t', float_precision='high', low_memory=False, na_values="NA", keep_default_na=False, usecols=used_columns, dtype=dtypes)
+        return pl.read_csv(self.input_file, sep='\t', null_values="NA", columns=used_columns, dtypes=dtypes)
+
+    def get_sub_df(self, all_epitopes_df, key):
         key_str = "{}-{}-{}-{}-{}".format(key[0], key[1], key[2], key[3], key[4])
-        df = (pd.read_csv(self.input_file, delimiter='\t', float_precision='high', low_memory=False, na_values="NA", keep_default_na=False, usecols=used_columns, dtype=dtypes)
-                [lambda x: (x['Chromosome'] == key[0]) & (x['Start'] == key[1]) & (x['Stop'] == key[2]) & (x['Reference'] == key[3]) & (x['Variant'] == key[4])])
-        df.fillna(value={"Tumor RNA Depth": 0, "Tumor RNA VAF": 0, "Tumor DNA VAF": 0, "Gene Expression": 0}, inplace=True)
-        df['Variant Type'] = df['Variant Type'].cat.add_categories('NA')
-        df['Mutation Position'] = df['Mutation Position'].cat.add_categories('NA')
-        df.fillna(value="NA", inplace=True)
-        df['annotation'] = df[['Transcript', 'Gene Name', 'Mutation', 'Protein Position']].agg('-'.join, axis=1)
-        df['key'] = key_str
+        df = all_epitopes_df.filter((pl.col("Chromosome") == key[0]) & (pl.col("Start") == key[1]) & (pl.col("Stop") == key[2]) & (pl.col("Reference") == key[3]) & (pl.col("Variant") == key[4]))
+        df = df.with_columns(pl.col(["Tumor RNA Depth", "Tumor RNA VAF", "Tumor DNA VAF", "Gene Expression", "Median MT Score"]).fill_null(0))
+        with pl.StringCache():
+            cat_list = list(set(df.select("Variant Type").to_series().to_list()))
+            cat_list.append("NA")
+            pl.Series(cat_list).cast(pl.Categorical)
+            df = df.with_column(pl.col("Variant Type").cast(pl.Categorical))
+        with pl.StringCache():
+            cat_list = list(set(df.select("Mutation Position").to_series().to_list()))
+            cat_list.append("NA")
+            pl.Series(cat_list).cast(pl.Categorical)
+            df = df.with_column(pl.col("Mutation Position").cast(pl.Categorical))
+        # df = df.fill_nan("NA")
+        df = df.with_columns(
+            [
+                pl.concat_str(
+                    [
+                        pl.col("Transcript"),
+                        pl.col("Gene Name"),
+                        pl.col("Mutation"),
+                        pl.col("Protein Position"),
+                    ],
+                    sep="-",
+                ).alias("annotation"),
+            ]
+        )
+        df = df.with_column(pl.Series([key_str for i in range(df.shape[0])]).alias("key"))
+
         return (df, key_str)
 
     def get_best_binder(self, df):
-        df.sort_values(by=["Median MT Score", "Median WT Score"], inplace=True, ascending=[True, False])
-        return df.iloc[0].to_dict()
+        df = df.sort(
+            [pl.col("Median MT Score"), pl.col("Median WT Score")],
+            reverse=[False, True]
+            )
+        keys = df.columns
+        values = [df[0, i] for i in range(df.shape[1])]
+        
+        return dict(zip(keys, values))
 
     #assign mutations to a "Classification" based on their favorability
     def get_tier(self, mutation, vaf_clonal):
         anchor_residue_pass = True
         anchors = [1, 2, len(mutation["MT Epitope Seq"])-1, len(mutation["MT Epitope Seq"])]
         position = mutation["Mutation Position"]
-        if position != "NA":
+        if position is not None:
             if int(float(position)) in anchors:
-                if mutation["Median WT Score"] == "NA":
+                if mutation["Median WT Score"] is None:
                       anchor_residue_pass = False
                 elif mutation["Median WT Score"] < 1000:
                       anchor_residue_pass = False
@@ -314,16 +362,23 @@ class PvacseqAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCMeta):
         return "Poor"
 
     def get_good_binders(self, df, max_ic50):
-        return df[df["Median MT Score"] < max_ic50]
+        return df.filter(pl.col("Median MT Score") < max_ic50)
 
     def get_unique_good_binders(self, good_binders):
-        return pd.DataFrame(good_binders.groupby(['HLA Allele', 'MT Epitope Seq']).size().reset_index())
+        print(good_binders.columns)
+        return good_binders.groupby(['HLA Allele', 'MT Epitope Seq']).count().sort(
+            [pl.col("HLA Allele"), pl.col("MT Epitope Seq"), pl.col("count")], 
+            reverse=[False, False, True])
 
     def get_good_binders_metrics(self, good_binders, prediction_algorithms, hla_types):
         peptides = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        good_peptides = good_binders["MT Epitope Seq"].unique()
-        good_transcripts = good_binders['annotation'].unique()
+        # good_binders = good_binders.to_pandas()
+        good_peptides = good_binders["MT Epitope Seq"].unique().to_list()
+        good_transcripts = good_binders['annotation'].unique().to_list()
         for annotation in good_transcripts:
+            if annotation is None:
+                continue
+
             good_binders_annotation = good_binders[good_binders['annotation'] == annotation]
             for peptide in good_peptides:
                 good_binders_peptide_annotation = good_binders_annotation[good_binders_annotation['MT Epitope Seq'] == peptide]
@@ -388,8 +443,8 @@ class PvacseqAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCMeta):
             return "".join([wt_aa, best["Protein Position"], mt_aa])
 
     def calculate_allele_expr(self, line):
-        if line['Gene Expression'] == 'NA' or line['Tumor RNA VAF'] == 'NA':
-            return 'NA'
+        if line['Gene Expression'] is None or line['Tumor RNA VAF'] is None:
+            return None
         else:
             return round(float(line['Gene Expression']) * float(line['Tumor RNA VAF']), 3)
 
@@ -443,18 +498,16 @@ class PvacseqAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCMeta):
         #make sure the tiers sort in the expected order
         tier_sorter = ["Pass", "Relaxed", "LowExpr", "Anchor", "Subclonal", "Poor", "NoExpr"]
         sorter_index = dict(zip(tier_sorter,range(len(tier_sorter))))
-        df["rank_tier"] = df['Tier'].map(sorter_index)
+        df = df.with_column(df["Tier"].apply(lambda x: sorter_index[x]).alias("rank_tier"))
 
-        df["rank_ic50"] = df["IC50 MT"].rank(ascending=True, method='dense')
-        df["rank_expr"] = df["Allele Expr"].rank(ascending=False, method='dense')
-        df["rank"] = df["rank_ic50"] + df["rank_expr"]
+        df = df.with_column(df["IC50 MT"].rank(method='dense').alias("rank_ic50"))
+        df = df.with_column(df["Allele Expr"].rank(reverse=True, method='dense').alias("rank_expr"))
+        df = df.with_column((df["rank_ic50"] + df["rank_expr"]).alias("rank"))
 
-        df.sort_values(by=["rank_tier", "rank", "Gene", "AA Change"], inplace=True, ascending=True)
+        df = df.sort([pl.col("rank_tier"), pl.col("rank"), pl.col("Gene"), pl.col("AA Change")], 
+            reverse=[False, False, False, False])
 
-        df.drop(labels='rank_tier', axis=1, inplace=True)
-        df.drop(labels='rank_ic50', axis=1, inplace=True)
-        df.drop(labels='rank_expr', axis=1, inplace=True)
-        df.drop(labels='rank', axis=1, inplace=True)
+        df = df.drop(['rank_tier', 'rank_ic50', 'rank_expr', 'rank'])
 
         return df
 
@@ -478,23 +531,34 @@ class UnmatchedSequenceAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCM
     def calculate_clonal_vaf(self):
         return None
 
-    def read_input_file(self, key, used_columns, dtypes):
-        df = (pd.read_csv(self.input_file, delimiter='\t', float_precision='high', low_memory=False, na_values="NA", keep_default_na=False, dtype={"Mutation": str})
-                [lambda x: (x['Mutation'] == key)])
+    def read_input_file(self, used_columns, dtypes):
+        # return pd.read_csv(self.input_file, delimiter='\t', float_precision='high', low_memory=False, na_values="NA", keep_default_na=False, dtype={"Mutation": str})
+        return pl.read_csv(self.input_file, sep='\t', null_values="NA", dtypes={"Mutation": str})
+
+    def get_sub_df(self, all_epitopes_df, key):
+        df = all_epitopes_df.filter(pl.col("Mutation") == key)
         return (df, key)
 
     def get_best_binder(self, df):
-        df.sort_values(by=["Median Score"], inplace=True, ascending=True)
-        return df.iloc[0]
+        # df.sort_values(by=["Median Score"], inplace=True, ascending=True)
+        # return df.iloc[0]
+        df = df.sort(by = "Median Score")
+        keys = df.columns
+        values = [df[0, i] for i in range(df.shape[1])]
+        print(values)
+        
+        return dict(zip(keys, values))
 
     def get_tier(self, mutation, vaf_clonal):
         return "NA"
 
     def get_good_binders(self, df, max_ic50):
-        return df[df["Median Score"] < max_ic50]
+        return df.filter(pl.col("Median Score") < max_ic50)
 
     def get_unique_good_binders(self, good_binders):
-        return pd.DataFrame(good_binders.groupby(['HLA Allele', 'Epitope Seq']).size().reset_index())
+        return good_binders.groupby(['HLA Allele', 'Epitope Seq']).count().sort(
+            [pl.col("HLA Allele"), pl.col("Epitope Seq"), pl.col("count")], 
+            reverse=[False, False, True])
 
     def get_good_binders_metrics(self, good_binders, prediction_algorithms, hla_types):
         return None
@@ -554,8 +618,7 @@ class UnmatchedSequenceAggregateAllEpitopes(AggregateAllEpitopes, metaclass=ABCM
 
     #sort the table in our preferred manner
     def sort_table(self, df):
-        df.sort_values(by=["IC50 MT", "ID"], inplace=True, ascending=[True, True])
-        return df
+        return df.sort([pl.col("IC50 MT"), pl.col("ID")], reverse=[False, False])
 
     def copy_pvacview_r_files(self):
         pass
