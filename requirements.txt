@@ -45,7 +45,7 @@ polars==0.14.27
 progressbar33==2.4
 protobuf==3.19.4
 psutil==5.9.0
-pyarrow==1.18.5
+pyarrow==10.0.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
 pyensembl==1.9.4
